@@ -353,10 +353,21 @@ class MMEncoder:
             from sglang.srt.mem_cache.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
-            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
+            from sglang.srt.mem_cache.embedding_store import (
+                EmbeddingStoreConfig,
+                EmbeddingStoreFactory,
+            )
 
             embedding_store = EmbeddingStoreFactory.create_backend(
-                self.server_args.mm_global_cache_backend,
+                backend_name=self.server_args.mm_global_cache_backend,
+                config=EmbeddingStoreConfig(
+                    tp_rank=rank,
+                    tp_size=server_args.tp_size,
+                    model_name=server_args.model_path,
+                    extra_config=(
+                        self.server_args.mm_global_cache_backend_extra_config or {}
+                    ),
+                ),
             )
             hidden_dims = self._infer_embedding_dims()
             self.mm_global_cache = EmbeddingCacheController(
@@ -922,7 +933,7 @@ class MMEncoder:
                 )
             else:
                 mm_hashes = hashes
-            # L2 cache expects string keys for Mooncake.
+            # Global embedding stores use string keys.
             str_mm_hashes = [str(h) for h in mm_hashes]
 
         return GlobalCacheEncodeContext(

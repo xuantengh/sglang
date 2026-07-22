@@ -574,7 +574,7 @@ class EmbeddingCacheController:
 
             logger.info(
                 f"Req {req_id}: Starting global fetch for {len(keys)} "
-                f"embeddings from Mooncake."
+                f"embeddings from {self.embedding_store.backend_name}."
             )
 
             op = EmbeddingPrefetchOperation(req_id, keys, all_ptrs, all_sizes)
@@ -588,7 +588,7 @@ class EmbeddingCacheController:
     ):
         """Issues ONE batch PUT for embeddings already in the host pool.
 
-        Only READY entries are pushed to Mooncake for multi-node sharing.
+        Only READY entries are pushed to the global store for multi-node sharing.
         If an entry was never stored (e.g. store_to_pool_async allocation failed),
         it is silently skipped.
         """
@@ -616,7 +616,8 @@ class EmbeddingCacheController:
             if keys:
                 logger.info(
                     f"Global Cache: Inserting {len(keys)} embeddings into "
-                    f"Mooncake cluster ({skipped_count} skipped)"
+                    f"{self.embedding_store.backend_name} "
+                    f"({skipped_count} skipped)"
                 )
                 self.insert_queue.put(
                     EmbeddingInsertOperation(keys, all_ptrs, all_sizes)
@@ -646,7 +647,8 @@ class EmbeddingCacheController:
                     continue
                 if not success:
                     logger.warning(
-                        f"[Rank {self.tp_rank}] Mooncake PUT failed for "
+                        f"[Rank {self.tp_rank}] "
+                        f"{self.embedding_store.backend_name} PUT failed for "
                         f"{mm_hash}; keeping local cache entry."
                     )
                 self._unpin_read(entry)
@@ -663,11 +665,15 @@ class EmbeddingCacheController:
                         op.keys, op.ptrs, op.sizes
                     )
                 except Exception:
-                    logger.exception("Mooncake multi-buffer GET failed")
+                    logger.exception(
+                        "%s multi-buffer GET failed",
+                        self.embedding_store.backend_name,
+                    )
                     results = [False] * len(op.keys)
                 success_count = sum(results)
                 logger.info(
-                    f"Mooncake GET Finished: Req {op.req_id}, "
+                    f"{self.embedding_store.backend_name} GET Finished: "
+                    f"Req {op.req_id}, "
                     f"Successfully fetched {success_count}/{len(op.keys)} embeddings."
                 )
                 self._finish_get(op, results)
@@ -683,11 +689,15 @@ class EmbeddingCacheController:
                         op.keys, op.ptrs, op.sizes
                     )
                 except Exception:
-                    logger.exception("Mooncake multi-buffer PUT failed")
+                    logger.exception(
+                        "%s multi-buffer PUT failed",
+                        self.embedding_store.backend_name,
+                    )
                     results = [False] * len(op.keys)
                 self._finish_put(op, results)
                 logger.info(
-                    f"Mooncake PUT Finished: Stored {sum(results)}/{len(op.keys)} "
+                    f"{self.embedding_store.backend_name} PUT Finished: "
+                    f"Stored {sum(results)}/{len(op.keys)} "
                     f"embeddings in cluster."
                 )
                 self.insert_queue.task_done()

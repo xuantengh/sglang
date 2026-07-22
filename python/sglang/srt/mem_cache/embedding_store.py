@@ -4,11 +4,21 @@
 import abc
 import importlib
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+import msgspec
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingStoreConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """Process-local configuration shared by embedding store backends."""
+
+    tp_rank: int
+    tp_size: int
+    model_name: Optional[str]
+    extra_config: Dict[str, Any] = {}
 
 
 class EmbeddingStore(abc.ABC):
@@ -16,7 +26,14 @@ class EmbeddingStore(abc.ABC):
 
     Stores pre-computed vision/audio embeddings by content hash so they
     can be shared across nodes without re-running the encoder.
+
+    Transfer methods receive CPU buffer addresses and byte sizes. The
+    multi-buffer variants represent one logical embedding with several
+    non-contiguous page runs. Every batch method returns one status per hash.
+    Backends that require memory registration can override ``register_buffer``.
     """
+
+    backend_name = "embedding store"
 
     @abc.abstractmethod
     def batch_get(
@@ -60,7 +77,11 @@ class EmbeddingStore(abc.ABC):
 
 
 class EmbeddingStoreFactory:
-    """Factory for creating embedding store backend instances."""
+    """Factory for creating embedding store backend instances.
+
+    Registered backend classes must accept one ``EmbeddingStoreConfig``
+    positional argument and implement the ``EmbeddingStore`` transfer contract.
+    """
 
     _registry: Dict[str, Dict[str, Any]] = {}
 
@@ -103,7 +124,9 @@ class EmbeddingStoreFactory:
         }
 
     @classmethod
-    def create_backend(cls, backend_name: str, **kwargs) -> EmbeddingStore:
+    def create_backend(
+        cls, backend_name: str, config: EmbeddingStoreConfig
+    ) -> EmbeddingStore:
         if backend_name not in cls._registry:
             available = list(cls._registry.keys())
             raise ValueError(
@@ -117,11 +140,21 @@ class EmbeddingStoreFactory:
             f"Creating embedding store backend '{backend_name}' "
             f"({entry['module_path']}.{entry['class_name']})"
         )
-        return backend_class(**kwargs)
+        return backend_class(config)
 
 
-EmbeddingStoreFactory.register_backend(
-    "mooncake",
-    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store",
-    "MooncakeEmbeddingStore",
+_DEFAULT_EMBEDDING_BACKENDS = (
+    (
+        "mooncake",
+        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store",
+        "MooncakeEmbeddingStore",
+    ),
+    (
+        "hicache",
+        "sglang.srt.mem_cache.storage.hicache_embedding_store",
+        "HiCacheEmbeddingStore",
+    ),
 )
+
+for name, mod_path, cls_name in _DEFAULT_EMBEDDING_BACKENDS:
+    EmbeddingStoreFactory.register_backend(name, mod_path, cls_name)

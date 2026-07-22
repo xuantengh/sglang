@@ -1,22 +1,24 @@
 import logging
-from typing import Any, List
+from typing import List
 
-from sglang.srt.mem_cache.embedding_store import EmbeddingStore
+from sglang.srt.mem_cache.embedding_store import EmbeddingStore, EmbeddingStoreConfig
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeBaseStore
 
 logger = logging.getLogger(__name__)
 
 
 class MooncakeEmbeddingStore(MooncakeBaseStore, EmbeddingStore):
+    backend_name = "Mooncake"
+
     def __init__(
         self,
-        storage_config: Any = None,
+        config: EmbeddingStoreConfig,
     ):
         super().__init__()
 
         MooncakeDistributedStore = self._import_mooncake_store()
         self.store = MooncakeDistributedStore()
-        self.config = self._load_config(storage_config)
+        self.config = self._load_config(config)
         ret_code = self.store.setup(
             self.config.local_hostname,
             self.config.metadata_server,

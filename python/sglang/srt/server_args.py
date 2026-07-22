@@ -2311,9 +2311,17 @@ class ServerArgs:
         Arg(
             help="Storage backend for the multimodal global embedding cache. "
             "Used when --enable-mm-global-cache is set.",
-            choices=["mooncake"],
+            choices=["mooncake", "hicache"],
         ),
     ] = "mooncake"
+    mm_global_cache_backend_extra_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Backend-specific configuration for the multimodal global "
+            "embedding cache, provided as a JSON object.",
+            type_parser=json.loads,
+        ),
+    ] = None
     disable_fast_image_processor: A[
         bool,
         "Adopt base image processor instead of fast image processor.",
