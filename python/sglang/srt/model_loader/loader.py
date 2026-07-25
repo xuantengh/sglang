@@ -3258,6 +3258,7 @@ def get_model_loader(
     model_optloader_allowed = model_config and load_config.load_format not in (
         LoadFormat.RUNAI_STREAMER,
         LoadFormat.REMOTE_INSTANCE,
+        LoadFormat.IPC_CACHE,
     )
 
     if model_optloader_allowed and (

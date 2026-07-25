@@ -2168,6 +2168,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    def rebind_after_ipc_import(self, layer: torch.nn.Module) -> None:
+        """Re-wire the token dispatcher after weights arrive over CUDA IPC."""
+        layer.dispatcher.set_quant_config(
+            {
+                "input_global_scale": (
+                    layer.w13_input_scale_quant
+                    if MOE_NVFP4_DISPATCH
+                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    else None
+                )
+            }
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
