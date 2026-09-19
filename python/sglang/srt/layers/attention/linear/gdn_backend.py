@@ -311,15 +311,14 @@ class GDNKernelDispatcher:
                 )
 
                 cutedsl_kernel = CuteDSLGDNKernel()
-            # The CuteDSL prefill kernel only exists on SM100+ (Blackwell).
-            # On SM90 (Hopper) fall back to Triton so users can pick
-            # `cutedsl` uniformly across hardware.
+            # Architecture-specific local prefill kernels exist for SM90
+            # (WGMMA/TMA) and SM100+ (tcgen05/TMEM).
             if cutedsl_kernel.supports_prefill:
                 self.extend_kernel = cutedsl_kernel
             else:
                 rank0_log(
                     "CuTe DSL GDN prefill is not supported on this GPU "
-                    "(requires SM100+). Falling back to Triton for prefill."
+                    "(requires SM90+). Falling back to Triton for prefill."
                 )
                 self.extend_kernel = triton_kernel
         elif prefill_backend.is_flashinfer():
