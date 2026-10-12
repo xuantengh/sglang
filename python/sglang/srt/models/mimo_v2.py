@@ -85,7 +85,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -400,6 +400,16 @@ class MiMoV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
+        if get_moe_a2a_backend().is_megamoe() and not (
+            get_platform().is_sm90
+            and getattr(quant_config, "is_fp4_experts", False)
+            and get_moe_runner_backend().is_marlin()
+        ):
+            raise ValueError(
+                "MiMo MegaMoE currently supports SM90 MXFP4 experts with "
+                "--moe-runner-backend marlin."
+            )
+
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -481,10 +491,54 @@ class MiMoV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if get_moe_a2a_backend().is_megamoe():
+            return self.forward_mega_moe(hidden_states, forward_batch)
         if not self._enable_a2a_moe:
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_mega_moe(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.mega_moe import run_mega_routed_experts
+
+        if not getattr(self.experts, "_mega_moe_sm90_mxfp4_weights", False):
+            raise RuntimeError(
+                "MiMo MegaMoE currently requires SM90 MXFP4 experts and "
+                "--moe-runner-backend marlin."
+            )
+        num_tokens = hidden_states.shape[0]
+        topk_ids = topk_weights = None
+        if num_tokens > 0:
+            topk_output = self.topk(
+                hidden_states,
+                self.gate(hidden_states),
+                num_token_non_padded=(
+                    forward_batch.moe_num_token_non_padded()
+                    if forward_batch is not None
+                    else None
+                ),
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id
+                ),
+            )
+            topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
+
+        # Empty ranks must still join the collective. The returned rows are
+        # already combined; no additional TP/EP reduction is needed.
+        return run_mega_routed_experts(
+            self.experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.moe_intermediate_size,
+            top_k=self.config.num_experts_per_tok,
+            num_tokens=num_tokens,
+        )
 
     def forward_normal(
         self,

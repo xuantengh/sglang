@@ -7,7 +7,7 @@ import torch
 from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
 
@@ -43,15 +43,24 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
 
 
 class Mxfp4MarlinMoEMethod:
-    """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
+    """Load MXFP4 experts for Marlin or the opt-in SM90 W4A8 MegaMoE path."""
 
     fuse_routed_scaling_factor_in_topk = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self.use_mega_moe and (
+            not self._fp8.is_fp4_expert or self._fp8.dequant_fp4_to_fp8
+        ):
+            raise ValueError("MXFP4 MegaMoE requires the checkpoint's FP4 weights.")
 
     def create_moe_runner(self, layer, moe_runner_config):
+        if self.use_mega_moe:
+            # MegaMoE combines dispatch, expert computation and combine itself.
+            self.runner = None
+            return
         from sglang.srt.layers.moe.moe_runner import MoeRunner
 
         self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
@@ -134,6 +143,18 @@ class Mxfp4MarlinMoEMethod:
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.use_mega_moe:
+            from sglang.srt.layers.moe.mega_moe_sm90 import (
+                build_sm90_mxfp4_mega_moe_experts_weights,
+            )
+
+            build_sm90_mxfp4_mega_moe_experts_weights(layer)
+            log_info_on_rank0(
+                logger,
+                f"Prepared SM90 W4A8 MegaMoE experts (layer: {self.prefix}).",
+            )
+            return
+
         from sglang.srt.layers.quantization.marlin_utils import (
             check_moe_marlin_supports_layer,
         )
@@ -177,6 +198,11 @@ class Mxfp4MarlinMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        if self.use_mega_moe:
+            raise RuntimeError(
+                "MXFP4 MegaMoE weights cannot use the Marlin fallback; "
+                "this model must call run_mega_routed_experts directly."
+            )
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 

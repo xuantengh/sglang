@@ -162,7 +162,9 @@ def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
     if _device_sm == 90:
-        return is_sm90_fp8_mega_moe_available(experts)
+        return getattr(
+            experts, "_mega_moe_sm90_mxfp4_weights", False
+        ) or is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
     return _device_sm // 10 == 10
 

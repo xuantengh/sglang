@@ -325,6 +325,8 @@ class TestPrepareServerArgs(CustomTestCase):
         for arch in (
             "InternS2PreviewForConditionalGeneration",
             "MellumForCausalLM",
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
             "Qwen3MoeForCausalLM",
             "DeepseekV4ForCausalLM",
         ):

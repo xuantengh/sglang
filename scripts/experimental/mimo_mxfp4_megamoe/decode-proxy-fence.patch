@@ -1,0 +1,7 @@
+--- a/deep_gemm/include/deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm90_fp8_fp4_mega_moe.cuh
+@@ -854,2 +854,4 @@
+             smem_b_packed[cur_stage_idx], smem_b[cur_stage_idx], smem_sfb[cur_stage_idx]);
++        // Publish generic shared stores before asynchronous WGMMA reads.
++        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+         arrive_or_sync_fp4_decode_done(cur_stage_idx);

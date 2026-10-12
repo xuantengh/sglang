@@ -4,7 +4,7 @@ import sys
 import unittest
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import torch
 
@@ -13,7 +13,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend, mega_moe
+from sglang.srt.layers.moe import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    mega_moe,
+    mega_moe_sm90,
+)
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_module
 from sglang.srt.layers.moe.topk import TopKConfig
@@ -43,6 +48,125 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def tearDown(self):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
+
+    def test_sm90_selects_weight_precision_and_preserves_empty_output(self):
+        deep_gemm = self.deep_gemm
+        buffer = SimpleNamespace(x=None, x_sf=None, topk_idx=None, topk_weights=None)
+
+        def pre_dispatch(*args, group_size, **kwargs):
+            self.assertEqual(group_size, 128)
+
+        def fp8(y, *args, recipe, **kwargs):
+            self.assertEqual(recipe, (128, 128, 128))
+            y.fill_(8)
+
+        def mxfp4(y, *args, recipe, **kwargs):
+            self.assertEqual(recipe, (1, 1, 32))
+            y.fill_(4)
+
+        deep_gemm.mega_moe_pre_dispatch_sm90 = pre_dispatch
+        deep_gemm.fp8_mega_moe = fp8
+        deep_gemm.fp8_fp4_mega_moe = mxfp4
+        for is_mxfp4 in (False, True):
+            for tokens in (0, 3):
+                with self.subTest(mxfp4=is_mxfp4, tokens=tokens):
+                    experts = SimpleNamespace(
+                        mega_l1_weights=None,
+                        mega_l2_weights=None,
+                        _mega_moe_sm90_mxfp4_weights=is_mxfp4,
+                    )
+                    with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+                        out = mega_moe_sm90.run_sm90_mega_routed(
+                            experts,
+                            torch.zeros(tokens, 128, dtype=torch.bfloat16),
+                            torch.zeros(tokens, 2, dtype=torch.int32),
+                            torch.zeros(tokens, 2),
+                            buffer,
+                            tokens,
+                            hidden_size=128,
+                        )
+                    self.assertEqual(out.shape, (tokens, 128))
+                    self.assertEqual(out.dtype, torch.bfloat16)
+                    torch.testing.assert_close(
+                        out, torch.full_like(out, 4 if is_mxfp4 else 8)
+                    )
+
+    def test_sm90_mxfp4_rejects_missing_dependency_and_invalid_layout(self):
+        experts = SimpleNamespace(
+            _mega_moe_weights_built=False,
+            _mega_moe_w4a4=False,
+            hidden_size=128,
+            moe_runner_config=SimpleNamespace(swiglu_limit=None),
+            w13_weight=torch.zeros(2, 256, 64, dtype=torch.int8),
+            w2_weight=torch.zeros(2, 128, 64, dtype=torch.int8),
+            w13_weight_scale_inv=torch.zeros(2, 256, 4),
+            w2_weight_scale_inv=torch.zeros(2, 128, 4),
+        )
+        with (
+            patch.object(mega_moe_sm90, "_device_sm", 90),
+            patch.dict(sys.modules, {"deep_gemm": self.deep_gemm}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "DeepGEMM PR #53"):
+                mega_moe_sm90.build_sm90_mxfp4_mega_moe_experts_weights(experts)
+            self.deep_gemm.transform_weights_for_mega_moe_sm90_fp4 = Mock(
+                side_effect=AssertionError("Invalid weights reached DeepGEMM")
+            )
+            with self.assertRaisesRegex(ValueError, "checkpoint E8M0"):
+                mega_moe_sm90.build_sm90_mxfp4_mega_moe_experts_weights(experts)
+            experts._mega_moe_w4a4 = True
+            with self.assertRaisesRegex(ValueError, "not W4A4"):
+                mega_moe_sm90.build_sm90_mxfp4_mega_moe_experts_weights(experts)
+            experts._mega_moe_w4a4 = False
+            experts.moe_runner_config.swiglu_limit = 7.0
+            with self.assertRaisesRegex(ValueError, "unclamped"):
+                mega_moe_sm90.build_sm90_mxfp4_mega_moe_experts_weights(experts)
+        self.assertFalse(experts._mega_moe_weights_built)
+
+    def test_mimo_mega_moe_routes_padded_tokens_and_empty_ranks(self):
+        from sglang.srt.models.mimo_v2 import MiMoV2MoE
+
+        hidden = torch.arange(384, dtype=torch.bfloat16).reshape(3, 128)
+        ids = torch.zeros(3, 2, dtype=torch.int32)
+        weights = torch.full((3, 2), 0.5)
+        topk = Mock(return_value=SimpleNamespace(topk_ids=ids, topk_weights=weights))
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(_mega_moe_sm90_mxfp4_weights=True),
+            config=SimpleNamespace(
+                hidden_size=128, moe_intermediate_size=256, num_experts_per_tok=2
+            ),
+            layer_id=1,
+            gate=lambda x: x,
+            topk=topk,
+        )
+        dispatched_rows = []
+
+        def run_experts(experts, x, topk_ids, topk_weights, **kwargs):
+            dispatched_rows.append(x.shape[0])
+            self.assertEqual(kwargs["num_tokens"], x.shape[0])
+            if x.shape[0]:
+                self.assertIs(topk_ids, ids)
+                self.assertIs(topk_weights, weights)
+            else:
+                self.assertIsNone(topk_ids)
+                self.assertIsNone(topk_weights)
+            return x + 1
+
+        with (
+            patch.object(mega_moe, "run_mega_routed_experts", run_experts),
+            patch.object(
+                mega_moe.ExpertLocationDispatchInfo, "init_new", return_value=None
+            ),
+        ):
+            out = MiMoV2MoE.forward_mega_moe(
+                moe, hidden, SimpleNamespace(moe_num_token_non_padded=lambda: 2)
+            )
+            torch.testing.assert_close(out, hidden + 1)
+            self.assertEqual(topk.call_args.kwargs["num_token_non_padded"], 2)
+            moe.topk = Mock(side_effect=AssertionError("Empty rank ran the router"))
+            out = MiMoV2MoE.forward_mega_moe(moe, hidden[:0])
+            self.assertEqual(out.shape, (0, 128))
+            # An empty local batch still owes its peers one collective call.
+            self.assertEqual(dispatched_rows, [3, 0])
 
     def test_mxf4_buffer_uses_typed_api(self):
         deep_gemm = self.deep_gemm

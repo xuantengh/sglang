@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""SM90 FP8 Mega-MoE forward path and expert-weight prep."""
+"""SM90 FP8 and MXFP4 Mega-MoE forward paths and expert-weight prep."""
 
 from __future__ import annotations
 
@@ -37,6 +37,64 @@ def is_sm90_fp8_mega_moe_available(experts) -> bool:
         and hasattr(deep_gemm, "mega_moe_pre_dispatch_sm90")
         and getattr(experts, "_mega_moe_sm90_fp8_weights", False)
     )
+
+
+def build_sm90_mxfp4_mega_moe_experts_weights(experts) -> None:
+    """Repack checkpoint FP4 bytes and E8M0 scales; do not requantize weights."""
+    if getattr(experts, "_mega_moe_weights_built", False):
+        return
+    if _device_sm != 90:
+        raise ValueError("MXFP4 W4A8 MegaMoE requires an SM90 GPU.")
+    if experts._mega_moe_w4a4:
+        raise ValueError("SM90 MXFP4 MegaMoE supports W4A8, not W4A4.")
+    if experts.moe_runner_config.swiglu_limit is not None:
+        raise ValueError("SM90 MXFP4 MegaMoE currently requires unclamped SwiGLU.")
+
+    try:
+        import deep_gemm
+
+        transform = deep_gemm.transform_weights_for_mega_moe_sm90_fp4
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "SM90 MXFP4 MegaMoE requires DeepGEMM PR #53 "
+            "(https://github.com/sgl-project/DeepGEMM/pull/53), including the "
+            "FP4 decode async-proxy fence fix. Install the patched dependency "
+            "before using --moe-a2a-backend megamoe."
+        ) from exc
+
+    w13, w2 = experts.w13_weight.data, experts.w2_weight.data
+    sf13 = experts.w13_weight_scale_inv.data
+    sf2 = experts.w2_weight_scale_inv.data
+    if w13.dtype != torch.int8 or w2.dtype != torch.int8:
+        raise ValueError("SM90 MXFP4 MegaMoE expects packed int8 weight storage.")
+    if sf13.dtype != torch.float8_e8m0fnu or sf2.dtype != torch.float8_e8m0fnu:
+        raise ValueError("SM90 MXFP4 MegaMoE expects checkpoint E8M0 scales.")
+    hidden, intermediate = w2.shape[1], w13.shape[1] // 2
+    if (
+        hidden != experts.hidden_size
+        or hidden % 128
+        or intermediate % 128
+        or intermediate > 4096
+        or w13.shape != (w2.shape[0], 2 * intermediate, hidden // 2)
+        or w2.shape[2] != intermediate // 2
+        or sf13.shape != (w13.shape[0], 2 * intermediate, hidden // 32)
+        or sf2.shape != (w2.shape[0], hidden, intermediate // 32)
+    ):
+        raise ValueError(
+            "SM90 MXFP4 MegaMoE requires unpadded expert weights, dimensions "
+            "divisible by 128, intermediate_size <= 4096, and one E8M0 "
+            "scale per 32 weights."
+        )
+
+    # Conversion to float represents the existing power-of-two scales exactly.
+    # DeepGEMM packs their exponent bytes and interleaves gate/up rows.
+    l1, l2 = transform((w13, sf13.float()), (w2, sf2.float()))
+    experts.w13_weight.data, experts.w13_weight_scale_inv.data = l1
+    experts.w2_weight.data, experts.w2_weight_scale_inv.data = l2
+    experts.mega_l1_weights = l1
+    experts.mega_l2_weights = l2
+    experts._mega_moe_sm90_mxfp4_weights = True
+    experts._mega_moe_weights_built = True
 
 
 def run_sm90_mega_routed(
@@ -71,12 +129,14 @@ def run_sm90_mega_routed(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    deep_gemm.fp8_mega_moe(
+    is_mxfp4 = getattr(experts, "_mega_moe_sm90_mxfp4_weights", False)
+    kernel = deep_gemm.fp8_fp4_mega_moe if is_mxfp4 else deep_gemm.fp8_mega_moe
+    kernel(
         y,
         experts.mega_l1_weights,
         experts.mega_l2_weights,
         buf,
-        recipe=(128, 128, 128),
+        recipe=(1, 1, 32) if is_mxfp4 else (128, 128, 128),
         activation="swiglu",
         activation_clamp=activation_clamp,
         fast_math=True,

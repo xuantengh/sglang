@@ -41,7 +41,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         or platform.is_hip
     ):
         raise ValueError(
-            "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
+            "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 / MXFP4 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
             "kernels over CUDA symmetric memory. On ROCm, set "
             "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
@@ -54,6 +54,8 @@ MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
         "DeepseekV4ForCausalLM",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
