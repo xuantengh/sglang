@@ -77,7 +77,9 @@ dependencies = [
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
-  "sgl-deep-gemm==0.2.2",
+  # SM90 W4A8 MegaMoE: DeepGEMM PR #53. Upstream VCS packaging and the
+  # fixes in scripts/experimental/mimo_mxfp4_megamoe are still required.
+  "sgl-deep-gemm @ git+https://github.com/qiushixiaoyu/DeepGEMM.git@b5675bf7c812a583d6eadabfa23ad1e00207c39d#subdirectory=sgl_deep_gemm",
   "sglang-kernel==0.4.9",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
