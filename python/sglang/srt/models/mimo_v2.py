@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.attention.mimo_rope_scale_qkv import mimo_rope_scale_qkv
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed.utils import get_group_rank_size
@@ -62,7 +63,7 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -726,6 +727,18 @@ class MiMoV2Attention(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
         )
 
+        # Preserve the BF16 fallback's arithmetic while avoiding separate RoPE,
+        # V scaling, and Q-contiguous launches on the qualified Hopper layout.
+        self.use_fused_qkv = (
+            get_platform().is_sm90
+            and self.head_dim == 192
+            and self.v_head_dim == 128
+            and type(self.rotary_emb) is RotaryEmbedding
+            and self.rotary_emb.rotary_dim == 64
+            and self.rotary_emb.is_neox_style
+            and not self.rotary_emb._force_native
+        )
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -756,6 +769,29 @@ class MiMoV2Attention(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def _prepare_qkv(self, positions: torch.Tensor, qkv: torch.Tensor):
+        if (
+            self.use_fused_qkv
+            and qkv.dtype == torch.bfloat16
+            and qkv.is_contiguous()
+            and positions.dtype == torch.int64
+            and positions.is_contiguous()
+        ):
+            self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            return mimo_rope_scale_qkv(
+                qkv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                1.0 if self.v_scale is None else self.v_scale,
+            )
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        if self.v_scale is not None:
+            v = v * self.v_scale
+        return q, k, v
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -765,11 +801,7 @@ class MiMoV2Attention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-
-        q, k = self.rotary_emb(positions, q, k)
-        if self.v_scale is not None:
-            v = v * self.v_scale
+        q, k, v = self._prepare_qkv(positions, qkv)
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -792,14 +824,7 @@ class MiMoV2Attention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-
-        # [t, h, dr]
-        q, k = self.rotary_emb(positions, q, k)
-        # [t, h, d]
-
-        if self.v_scale is not None:
-            v = v * self.v_scale
+        q, k, v = self._prepare_qkv(positions, qkv)
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
         return output

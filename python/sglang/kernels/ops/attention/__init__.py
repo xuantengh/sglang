@@ -60,6 +60,19 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.mimo_rope_scale_qkv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.mimo_rope_scale_qkv:mimo_rope_scale_qkv",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 0))}),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="Packed MiMo QKV: QK=192, V=128, NeoX RoPE=64, BF16 cache",
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.TRITON,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
