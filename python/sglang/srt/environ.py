@@ -699,6 +699,9 @@ class Envs:
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
     )
+    # Free request-owned SWA rows after the final prefill copy event completes.
+    # Excludes mixed batches, speculation, prefix sharing and HiSparse.
+    SGLANG_OPT_EVICT_COMPLETED_PREFILL_SWA = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
@@ -1323,6 +1326,10 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+
+    # MiMo SM90 optimizations; enable independently for A/B comparisons.
+    SGLANG_OPT_MIMO_TINY_ROUTER = EnvBool(False)
+    SGLANG_OPT_MIMO_SP_COLLECTIVES = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

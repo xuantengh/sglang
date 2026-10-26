@@ -5,6 +5,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_serving,
@@ -3865,6 +3866,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.seqlen - 1 - sliding_window_size
             >= req.kv.get_evicted_seqlen(ComponentType.SWA) + eviction_interval
         )
+
+    def maybe_evict_completed_prefill_swa(
+        self, req: Req, tree_cache: BasePrefixCache, *, copy_done_synchronized: bool
+    ) -> None:
+        """Release request-owned rows after the final prefill is GPU-complete."""
+        if (
+            copy_done_synchronized
+            and not self.decoding_reqs
+            and self.spec_algorithm.is_none()
+            and req.kv.holds_kv
+            and req.inflight_middle_chunks <= 0
+            and not req.is_retracted
+            and tree_cache.supports_swa()
+            and not tree_cache.supports_prefix_sharing()
+            and not get_memory().enable_hisparse
+        ):
+            tree_cache.evict_sliding_windows(req, len(req.origin_input_ids))
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():

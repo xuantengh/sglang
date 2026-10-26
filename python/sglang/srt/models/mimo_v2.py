@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.mimo_rope_scale_qkv import mimo_rope_scale_qkv
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -86,7 +87,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform, get_spec
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -356,6 +357,12 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
+        self._use_tiny_router = (
+            envs.SGLANG_OPT_MIMO_TINY_ROUTER.get()
+            and get_platform().is_sm90
+            and not is_nextn
+            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        )
         self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
@@ -375,6 +382,22 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
+        if (
+            self._use_tiny_router
+            and hidden_states.is_cuda
+            and self.dtype == torch.bfloat16
+            and hidden_states.dtype == self.weight.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and 0 < hidden_states.shape[0] <= 16
+            and self.weight.shape == (256, 4096)
+            and hidden_states.is_contiguous()
+            and self.weight.is_contiguous()
+        ):
+            from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+
+            return tiny_gemm_bf16(
+                hidden_states, self.weight, out_dtype=torch.float32, max_m=16
+            )
         if self.dtype != torch.float32 and hidden_states.is_cuda:
             return torch.mm(
                 hidden_states.to(self.dtype),
@@ -1052,6 +1075,7 @@ class MiMoV2Model(nn.Module):
         self.pp_group = get_parallel().pp_group
         self._kv_cache_parallel_layout = resolve_linear_parallel_group("attn_tp")
         self.layers_to_capture = []
+        self._maybe_init_sm90_sp_collectives()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1081,6 +1105,20 @@ class MiMoV2Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+
+    def _maybe_init_sm90_sp_collectives(self) -> None:
+        if (
+            envs.SGLANG_OPT_MIMO_SP_COLLECTIVES.get()
+            and self.config.hidden_size == 4096
+            and get_platform().is_sm90
+            and get_parallel().attn_tp_size == 4
+            and get_moe_a2a_backend().is_megamoe()
+            and get_spec().speculative_algorithm is None
+            and not get_exec().overlap.enable_two_batch_overlap
+            and not get_exec().overlap.enable_single_batch_overlap
+            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        ):
+            get_parallel().attn_tp_group.init_sm90_sp_comm()
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):

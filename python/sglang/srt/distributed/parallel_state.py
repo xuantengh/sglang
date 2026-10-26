@@ -484,6 +484,7 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        self.sm90_sp_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
 
         self.pcie_ipc_comm: Optional[Any] = None
@@ -1289,7 +1290,20 @@ class GroupCoordinator:
             pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
             return output
 
+    def init_sm90_sp_comm(self) -> None:
+        """Initialize optional SM90 sequence-parallel collectives before capture."""
+        if self.sm90_sp_comm is None:
+            from sglang.srt.distributed.device_communicators.sm90_sequence_parallel import (
+                SM90SequenceParallel,
+            )
+
+            self.sm90_sp_comm = SM90SequenceParallel.create(self.cpu_group, self.device)
+
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self.sm90_sp_comm is not None and self.sm90_sp_comm.try_all_gather(
+            output, input
+        ):
+            return
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
         # Aiter's should_custom_ag still owns shape/layout validation:
         # 16B alignment, weak-contiguous, supported topology, and per-rank
@@ -2093,6 +2107,10 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # The workspace closes collectively while its CPU group is still live.
+        if self.sm90_sp_comm is not None:
+            self.sm90_sp_comm.close()
+            self.sm90_sp_comm = None
         # Must precede destroy_process_group(): FlashInfer's workspace
         # teardown collectives on the group it was built with.
         if self.pcie_ipc_comm is not None:

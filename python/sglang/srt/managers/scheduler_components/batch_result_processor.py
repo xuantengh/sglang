@@ -384,6 +384,12 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         checkpoint_kv_cache(req, self.tree_cache)
+                        if envs.SGLANG_OPT_EVICT_COMPLETED_PREFILL_SWA.get():
+                            batch.maybe_evict_completed_prefill_swa(
+                                req,
+                                self.tree_cache,
+                                copy_done_synchronized=result.copy_done is not None,
+                            )
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 

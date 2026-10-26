@@ -192,6 +192,12 @@ def register_comm(comm: Communicator) -> None:
     _COMM_MAP[comm.world_size] = comm
 
 
+def unregister_comm(comm: Communicator) -> None:
+    """Release only this owner's registration after its final collective."""
+    if _COMM_MAP.get(comm.world_size) is comm:
+        del _COMM_MAP[comm.world_size]
+
+
 @register_custom_op(mutates_args=["output"])
 def _reduce_scatter_res_op(
     world_size: int,

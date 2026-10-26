@@ -142,6 +142,11 @@ def attn_tp_reduce_scatter(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     parallel = get_parallel()
+    sp_comm = parallel.attn_tp_group.sm90_sp_comm
+    if sp_comm is not None:
+        output = sp_comm.try_reduce_scatter(hidden_states)
+        if output is not None:
+            return output
     local_hidden_states = hidden_states.tensor_split(parallel.attn_tp_size)[
         parallel.attn_tp_rank
     ]
